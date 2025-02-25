@@ -6,6 +6,7 @@ import dgl
 import dgl.function as fn
 import numpy as np
 from TCFMM import f3s_1tb1rw_scheduled_permuteV_scaleQK
+from DFGNN.operators.fused_gtconv import GTConvFuse_inference_tiling, GTConvFuse_inference_hyper
 import FS_SDDMM
 import FS_SpMM
 """
@@ -129,6 +130,36 @@ class MultiHeadAttentionLayerFlashSparse(MultiHeadAttentionLayer):
         h_prime = h_prime.div(rows_sum) 
         return h_prime
 
+class MultiHeadAttentionLayerDfgnnHyper(MultiHeadAttentionLayer):
+    def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
+        super().__init__(in_dim, out_dim, num_heads, use_bias, seed)
+    
+    def forward(self, dfgnn_input, h):
+        Q_h = self.Q(h)
+        K_h = self.K(h)
+        V_h = self.V(h)
+        # Reshape into [num_nodes, num_heads, feat_dim]
+        Q_h = Q_h.view(-1, self.num_heads, self.out_dim)
+        K_h = K_h.view(-1, self.num_heads, self.out_dim)
+        V_h = V_h.view(-1, self.num_heads, self.out_dim)
+        out = GTConvFuse_inference_hyper(dfgnn_input.row_pointers, dfgnn_input.column_index, dfgnn_input.rows, dfgnn_input.val, dfgnn_input.smem_consume, Q_h, K_h, V_h)
+        return out
+    
+class MultiHeadAttentionLayerDfgnnTiling(MultiHeadAttentionLayer):
+    def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
+        super().__init__(in_dim, out_dim, num_heads, use_bias, seed)
+    
+    def forward(self, dfgnn_input, h):
+        Q_h = self.Q(h)
+        K_h = self.K(h)
+        V_h = self.V(h)
+        # Reshape into [num_nodes, num_heads, feat_dim]
+        Q_h = Q_h.view(-1, self.num_heads, self.out_dim)
+        K_h = K_h.view(-1, self.num_heads, self.out_dim)
+        V_h = V_h.view(-1, self.num_heads, self.out_dim)
+        out = GTConvFuse_inference_tiling(dfgnn_input.row_pointers, dfgnn_input.column_index, dfgnn_input.val, dfgnn_input.smem_consume, Q_h, K_h, V_h)
+        return out
+
 class MultiHeadAttentionLayerDense(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
         super().__init__(in_dim, out_dim, num_heads, use_bias, seed)
@@ -143,7 +174,6 @@ class MultiHeadAttentionLayerDense(MultiHeadAttentionLayer):
         E[rowInd, colInd] = torch.exp(E[rowInd, colInd] - E_max[rowInd])
         O = E @ torch.squeeze(g.ndata['V_h'])
         z = torch.sum(E, dim=1, keepdim=True)
-        print("z: ", z)
         return O/z
     
     def forward(self, g, h):
@@ -180,6 +210,12 @@ class GraphTransformerLayer(nn.Module):
             self.attention = MultiHeadAttentionLayerDense(in_dim, out_dim//num_heads, num_heads, use_bias)
         elif MLA_type == 'flashSparse':
             self.attention = MultiHeadAttentionLayerFlashSparse(in_dim, out_dim//num_heads, num_heads, use_bias)
+        elif MLA_type == 'dfgnn_hyper':
+            self.attention = MultiHeadAttentionLayerDfgnnHyper(in_dim, out_dim//num_heads, num_heads, use_bias)
+        elif MLA_type == 'dfgnn_tiling':
+            self.attention = MultiHeadAttentionLayerDfgnnTiling(in_dim, out_dim//num_heads, num_heads, use_bias)
+        else:
+            raise ValueError(f"Invalid MLA type: {MLA_type}")
         
         self.O = nn.Linear(out_dim, out_dim)
 

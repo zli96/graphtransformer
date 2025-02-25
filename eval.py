@@ -1,5 +1,4 @@
 import torch
-import dgl
 from dgl.data import CLUSTERDataset
 from nets.SBMs_node_classification.graph_transformer_net import GraphTransformerNet
 
@@ -18,14 +17,14 @@ def main():
     # Define model parameters (using same params as in config files)
     net_params = {
         'in_dim': test_graph.ndata['feat'].shape[0],  # Node feature dimension from data
-        'hidden_dim': 256,
-        'out_dim': 256,
+        'hidden_dim': 64,
+        'out_dim': 64,
         'n_classes': dataset.num_classes,  # Number of classes from dataset
         'n_heads': 1,
         'in_feat_dropout': 0.0,
         'dropout': 0.0,
-        'MLA_type': 'flashSparse',
-        'L': 10,  # Number of layers
+        'MLA_type': 'dgl',
+        'L': 1,  # Number of layers
         'residual': True,
         'readout': 'mean',
         'layer_norm': False,
@@ -50,15 +49,15 @@ def main():
     
     # Forward pass
     with torch.no_grad():
-        # model.check_accuracy(test_graph)
-        for i in range(3):
-            model(test_graph)
-        total_time = 0
-        for i in range(50):
-            pred, time_taken = model(test_graph)
-            total_time += time_taken
-        print("pred.shape", pred.shape)
-        print(f"avg time_taken: {total_time/10} ms")
+        model.check_accuracy(test_graph)
+        # for i in range(3):
+        #     model(test_graph)
+        # times = []
+        # for i in range(50):
+        #     pred, time_taken = model(test_graph)
+        #     times.append(time_taken)
+        # print(times)
+        # print(f"avg time_taken: {sum(times)/len(times)} ms")
         
     # Print predictions shape and a few values
     print(f"Graph has {test_graph.number_of_nodes()} nodes")

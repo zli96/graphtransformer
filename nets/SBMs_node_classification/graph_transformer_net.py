@@ -1,19 +1,14 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
+import numpy as np
 # import dgl
-
+from layers.graph_transformer_layer import GraphTransformerLayer
 """
     Graph Transformer
     
 """
-from layers.graph_transformer_layer import GraphTransformerLayer, \
-MultiHeadAttentionLayerF3S, MultiHeadAttentionLayer, MultiHeadAttentionLayerDense, \
-MultiHeadAttentionLayerFlashSparse
 from layers.mlp_readout_layer import MLPReadout
 from TCFMM import preprocess_gpu
-import FS_Block
 
 class f3sInput:
     def __init__(self, RowWindowOffset, sortedRowWindows,\
@@ -36,6 +31,14 @@ class fsInput:
         self.t_window_rowTensor = t_window_rowTensor
         self.t_atomicTensor = t_atomicTensor
         self.ones = ones
+
+class dfgnnInput:
+    def __init__(self, row_pointers, column_index, rows, val, smem_consume):
+        self.row_pointers = row_pointers
+        self.column_index = column_index
+        self.rows = rows
+        self.val = val
+        self.smem_consume = smem_consume
 
 class GraphTransformerNet(nn.Module):
 
@@ -105,6 +108,7 @@ class GraphTransformerNet(nn.Module):
         return f3s_input
 
     def flashSparse_preprocess_dataset(self, g):
+        import FS_Block
         partSize = 32
         window = 8
         wide = 16
@@ -138,33 +142,74 @@ class GraphTransformerNet(nn.Module):
                             t_window_rowTensor, t_atomicTensor, ones)
         return inputInfo
 
+    def dfgnn_preprocess_dataset(self, g, alg):
+        max_neigh = 128 # according to DF-GNN/DFGNN/layers/util.py
+        WARP_SIZE = 32
+        row_pointers, column_index, _ = g.adj_tensors('csr')
+        row_pointers = row_pointers.to(torch.int32)
+        column_index = column_index.to(torch.int32)
+        val = torch.ones(g.num_edges(), dtype=torch.float32, device=self.device)/np.sqrt(self.hidden_dim)
+        row_nnz = np.diff(row_pointers.cpu().numpy())
+        row_indices = np.repeat(np.arange(g.num_nodes()), row_nnz)
+        rows = torch.IntTensor(row_indices).cuda()
+        if alg == "dfgnn_tiling":
+            smem_consume = (max_neigh + WARP_SIZE - 1) // WARP_SIZE * WARP_SIZE
+        elif alg == "dfgnn_hyper":
+            smem_consume = (max_neigh * 8 + WARP_SIZE - 1) // WARP_SIZE * WARP_SIZE
+        else:
+            raise ValueError(f"Invalid algorithm: {alg}")
+        dfgnn_input = dfgnnInput(row_pointers, column_index, rows, val, smem_consume)
+        return dfgnn_input
+
     def check_accuracy(self, g):
+        from layers.graph_transformer_layer import MultiHeadAttentionLayerF3S, \
+            MultiHeadAttentionLayer, MultiHeadAttentionLayerDense, \
+            MultiHeadAttentionLayerFlashSparse, MultiHeadAttentionLayerDfgnnHyper, \
+            MultiHeadAttentionLayerDfgnnTiling
         h = g.ndata['feat']
         h = self.embedding_h(h)
         h = self.in_feat_dropout(h)
-        layer_f3s = MultiHeadAttentionLayerF3S(self.hidden_dim, self.hidden_dim, self.num_heads, False, seed=True).to(self.device)
         layer_dgl = MultiHeadAttentionLayer(self.hidden_dim, self.hidden_dim, self.num_heads, False, seed=True).to(self.device)
+        layer_f3s = MultiHeadAttentionLayerF3S(self.hidden_dim, self.hidden_dim, self.num_heads, False, seed=True).to(self.device)
         layer_dense = MultiHeadAttentionLayerDense(self.hidden_dim, self.hidden_dim, self.num_heads, False, seed=True).to(self.device)
         layer_flashSparse = MultiHeadAttentionLayerFlashSparse(self.hidden_dim, self.hidden_dim, self.num_heads, False, seed=True).to(self.device)
-        head_out_dgl = layer_dgl(g, h)
-        head_out_dgl = torch.squeeze(head_out_dgl)
-        print("head_out_dgl.shape: ", head_out_dgl.shape)
+        layer_dfgnn_hyper = MultiHeadAttentionLayerDfgnnHyper(self.hidden_dim, self.hidden_dim, self.num_heads, False, seed=True).to(self.device)
+        layer_dfgnn_tiling = MultiHeadAttentionLayerDfgnnTiling(self.hidden_dim, self.hidden_dim, self.num_heads, False, seed=True).to(self.device)
 
+        #######
+        # run the things
+        #######
         f3s_input = self.f3s_preprocess_dataset(g)
         head_out_f3s = layer_f3s(f3s_input, h)
 
+        h = g.ndata['feat']
+        h = self.embedding_h(h)
+        h = self.in_feat_dropout(h)
+
+        head_out_dgl = layer_dgl(g, h)
+        head_out_dgl = torch.squeeze(head_out_dgl)
+
         head_out_dense = layer_dense(g, h)
-        diff_dense = head_out_dgl - head_out_dense
 
         fs_input = self.flashSparse_preprocess_dataset(g)
         head_out_flashSparse = layer_flashSparse(fs_input, h)
-        # print("head_out[10:10, 10:10]: ", head_out_dgl[:10, :10])
-        # print("head_out_f3s[10:10, 10:10]: ", head_out_f3s[1][:10, :10])
-        print("relative error dense: ", torch.norm(diff_dense)/torch.norm(head_out_dgl))
-        diff_f3s = head_out_dgl - head_out_f3s[1]
-        print("relative error f3s: ", torch.norm(diff_f3s)/torch.norm(head_out_dgl))
+
+        dfgnn_input = self.dfgnn_preprocess_dataset(g, "dfgnn_hyper")
+        head_out_dfgnn_hyper = torch.squeeze(layer_dfgnn_hyper(dfgnn_input, h))
+        dfgnn_input = self.dfgnn_preprocess_dataset(g, "dfgnn_tiling")
+        head_out_dfgnn_tiling = torch.squeeze(layer_dfgnn_tiling(dfgnn_input, h))
+        print(f"head_out_dfgnn_hyper.shape: {head_out_dfgnn_hyper.shape} \nhead_out_dfgnn_tiling.shape: {head_out_dfgnn_tiling.shape}")
+        
+
+        #######
+        # compare the things
+        #######
+        diff_f3s = head_out_dgl - head_out_f3s
+        diff_dense = head_out_dgl - head_out_dense
         diff_flashSparse = head_out_dgl - head_out_flashSparse
-        print("relative error flashSparse: ", torch.norm(diff_flashSparse)/torch.norm(head_out_dgl))
+        diff_dfgnn_hyper = head_out_dgl - head_out_dfgnn_hyper
+        diff_dfgnn_tiling = head_out_dgl - head_out_dfgnn_tiling
+        print(f" relative error dfgnn_tiling: {torch.norm(diff_dfgnn_tiling)/torch.norm(head_out_dgl)} \n relative error dfgnn_hyper: {torch.norm(diff_dfgnn_hyper)/torch.norm(head_out_dgl)} \n relative error flashSparse: {torch.norm(diff_flashSparse)/torch.norm(head_out_dgl)} \n relative error dense: {torch.norm(diff_dense)/torch.norm(head_out_dgl)} \n relative error f3s: {torch.norm(diff_f3s)/torch.norm(head_out_dgl)}")
 
     def forward(self, g, h_lap_pos_enc=None, h_wl_pos_enc=None):
         if self.MLA_type == 'f3s':
@@ -175,6 +220,10 @@ class GraphTransformerNet(nn.Module):
             input = g
         elif self.MLA_type == 'flashSparse':
             input = self.flashSparse_preprocess_dataset(g)
+        elif self.MLA_type == 'dfgnn_hyper':
+            input = self.dfgnn_preprocess_dataset(g, "dfgnn_hyper")
+        elif self.MLA_type == 'dfgnn_tiling':
+            input = self.dfgnn_preprocess_dataset(g, "dfgnn_tiling")
         else:
             raise ValueError("Invalid MLA type, choose from 'f3s', 'dgl', 'dense'")
         
