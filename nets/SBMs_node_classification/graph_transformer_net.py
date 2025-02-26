@@ -74,6 +74,8 @@ class GraphTransformerNet(nn.Module):
         self.embedding_h = nn.Embedding(in_dim_node, self.hidden_dim) # node feat is an integer
         
         self.in_feat_dropout = nn.Dropout(in_feat_dropout)
+
+        self.linear_h = nn.Linear(in_dim_node, self.hidden_dim)
         
         self.layers = nn.ModuleList(
             [GraphTransformerLayer(self.hidden_dim, self.hidden_dim, self.num_heads,
@@ -119,7 +121,6 @@ class GraphTransformerNet(nn.Module):
         degrees, t_window_rowTensor,\
         t_atomicTensor = FS_Block.blockProcess_sddmm_balance_gnn(row_pointers.cpu(), column_index.cpu(), 
                                                                  window, wide, partSize)
-        print("Number of nonzero elements in degrees: ", torch.count_nonzero(degrees))
         row_pointers = row_pointers.cuda()
         column_index = column_index.cuda()
         degrees = degrees.cuda()
@@ -180,24 +181,26 @@ class GraphTransformerNet(nn.Module):
         # run the things
         #######
         f3s_input = self.f3s_preprocess_dataset(g)
-        head_out_f3s = layer_f3s(f3s_input, h)
+        head_out_f3s, _ = layer_f3s(f3s_input, h)
 
         h = g.ndata['feat']
         h = self.embedding_h(h)
         h = self.in_feat_dropout(h)
 
-        head_out_dgl = layer_dgl(g, h)
+        head_out_dgl, _ = layer_dgl(g, h)
         head_out_dgl = torch.squeeze(head_out_dgl)
 
-        head_out_dense = layer_dense(g, h)
+        head_out_dense, _ = layer_dense(g, h)
 
         fs_input = self.flashSparse_preprocess_dataset(g)
-        head_out_flashSparse = layer_flashSparse(fs_input, h)
+        head_out_flashSparse, _ = layer_flashSparse(fs_input, h)
 
         dfgnn_input = self.dfgnn_preprocess_dataset(g, "dfgnn_hyper")
-        head_out_dfgnn_hyper = torch.squeeze(layer_dfgnn_hyper(dfgnn_input, h))
+        head_out_dfgnn_hyper, _ = layer_dfgnn_hyper(dfgnn_input, h)
+        head_out_dfgnn_hyper = torch.squeeze(head_out_dfgnn_hyper)
         dfgnn_input = self.dfgnn_preprocess_dataset(g, "dfgnn_tiling")
-        head_out_dfgnn_tiling = torch.squeeze(layer_dfgnn_tiling(dfgnn_input, h))
+        head_out_dfgnn_tiling, _ = layer_dfgnn_tiling(dfgnn_input, h)
+        head_out_dfgnn_tiling = torch.squeeze(head_out_dfgnn_tiling)
         print(f"head_out_dfgnn_hyper.shape: {head_out_dfgnn_hyper.shape} \nhead_out_dfgnn_tiling.shape: {head_out_dfgnn_tiling.shape}")
         
 
@@ -230,27 +233,30 @@ class GraphTransformerNet(nn.Module):
         # input embedding
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        start.record()
         h = g.ndata['feat']
-        h = self.embedding_h(h)
-        if self.lap_pos_enc:
-            h_lap_pos_enc = self.embedding_lap_pos_enc(h_lap_pos_enc.float()) 
-            h = h + h_lap_pos_enc
-        if self.wl_pos_enc:
-            h_wl_pos_enc = self.embedding_wl_pos_enc(h_wl_pos_enc) 
-            h = h + h_wl_pos_enc
-        h = self.in_feat_dropout(h)
-        
+        start.record()
+        if h.dtype == torch.int32 or h.dtype == torch.int64:
+            h = self.embedding_h(h)
+            if self.lap_pos_enc:
+                h_lap_pos_enc = self.embedding_lap_pos_enc(h_lap_pos_enc.float()) 
+                h = h + h_lap_pos_enc
+            if self.wl_pos_enc:
+                h_wl_pos_enc = self.embedding_wl_pos_enc(h_wl_pos_enc) 
+                h = h + h_wl_pos_enc
+            h = self.in_feat_dropout(h)
+        else:
+            h = self.linear_h(h)
         # GraphTransformer Layers
+        kernel_time_total = 0
         for i, conv in enumerate(self.layers):
-            h = conv(input, h)
-            
+            h, kernel_time = conv(input, h)
+            kernel_time_total += kernel_time
         # output
         h_out = self.MLP_layer(h)
         end.record()
-        torch.cuda.synchronize()
-        time_taken = start.elapsed_time(end)
-        return h_out, time_taken
+        end.synchronize()
+        total_time = start.elapsed_time(end)
+        return h_out, total_time, kernel_time_total
     
     
     def loss(self, pred, label):

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import dgl
 import dgl.function as fn
 import numpy as np
-from TCFMM import f3s_1tb1rw_scheduled_permuteV_scaleQK
+from TCFMM import f3s_1tb1rw_scheduled_permuteV_scaleQK, f3s_1tb1rw_scheduled_permuteV
 from DFGNN.operators.fused_gtconv import GTConvFuse_inference_tiling, GTConvFuse_inference_hyper
 import FS_SDDMM
 import FS_SpMM
@@ -62,73 +62,103 @@ class MultiHeadAttentionLayer(nn.Module):
         g.ndata['Q_h'] = Q_h.view(-1, self.num_heads, self.out_dim)
         g.ndata['K_h'] = K_h.view(-1, self.num_heads, self.out_dim)
         g.ndata['V_h'] = V_h.view(-1, self.num_heads, self.out_dim)
-
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         self.propagate_attention(g)
+        end.record()
+        end.synchronize()
+        kernel_time = start.elapsed_time(end)
         head_out = g.ndata['wV']/g.ndata['z']
-        return head_out
+        return head_out, kernel_time
 
 # Assumes 1 head for now.
 class MultiHeadAttentionLayerF3S(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
         super().__init__(in_dim, out_dim, num_heads, use_bias, seed)
-        # Add any additional initialization specific to F3S version here
+        self.Q = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
+        self.K = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
+        self.V = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
     
     def forward(self, f3s_input, h):
         # Override the forward method to use F3S-specific implementation
-        Q_h = self.Q(h).to(torch.float16)
-        K_h = self.K(h).to(torch.float16)
-        V_h = self.V(h).to(torch.float16)
-
-        n_warp_per_block = 8
+        h = h.to(torch.float16)
+        Q_h = self.Q(h).view(-1, self.num_heads, self.out_dim)
+        K_h = self.K(h).view(-1, self.num_heads, self.out_dim)
+        V_h = self.V(h).view(-1, self.num_heads, self.out_dim)
+        h_out = torch.zeros(h.shape[0], self.num_heads, self.out_dim, dtype=torch.float32, device=h.device)
+        n_warp_per_block = 10
         # out is [time, O, S]
-        out = f3s_1tb1rw_scheduled_permuteV_scaleQK(
-                f3s_input.RowWindowOffset, 
-                f3s_input.sortedRowWindows, 
-                f3s_input.SparseAToXindex, 
-                f3s_input.TCblockBitMap, 
-                f3s_input.num_nodes, 
-                Q_h, K_h, V_h, 
-                np.sqrt(self.out_dim), n_warp_per_block)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for i in range(self.num_heads):
+            out = f3s_1tb1rw_scheduled_permuteV_scaleQK(
+                    f3s_input.RowWindowOffset, 
+                    f3s_input.sortedRowWindows, 
+                    f3s_input.SparseAToXindex, 
+                    f3s_input.TCblockBitMap, 
+                    f3s_input.num_nodes, 
+                    Q_h[:,i,:], K_h[:,i,:], V_h[:,i,:], 
+                    np.sqrt(self.out_dim), 
+                    n_warp_per_block)
+            h_out[:,i,:] = out[1]
+        end.record()
+        end.synchronize()
+        kernel_time = start.elapsed_time(end)
+        # print(f"f3s_1tb1rw_scheduled_permuteV_scaleQK time: {out[0]} ms")
         # return out
-        return out[1]
+        return h_out, kernel_time
 
 class MultiHeadAttentionLayerFlashSparse(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
         super().__init__(in_dim, out_dim, num_heads, use_bias, seed)
-    
+        self.Q = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
+        self.K = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
+        self.V = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
     def forward(self, inputInfo, h):
-        Q_h = self.Q(h).to(torch.float16)
-        K_h = self.K(h).to(torch.float16)
-        V_h = self.V(h).to(torch.float16)
-        sddmm_time, att = FS_SDDMM.forward_gen_fp16_gnn(   
-                            Q_h.size(1),                                      
-                            inputInfo.row_pointers, 
-                            inputInfo.column_index, 
-                            inputInfo.degrees, 
-                            inputInfo.t_window_rowTensor,
-                            Q_h,K_h,inputInfo.max)
-        spmm_ones_time, rows_sum = FS_SpMM.forward_fp16_gnn_ones(   
+        h = h.to(torch.float16)
+        Q_h = self.Q(h).view(-1, self.num_heads, self.out_dim)
+        K_h = self.K(h).view(-1, self.num_heads, self.out_dim)
+        V_h = self.V(h).view(-1, self.num_heads, self.out_dim)
+        out_h = torch.zeros(h.shape[0], self.num_heads, self.out_dim, dtype=torch.float32, device=h.device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for i in range(self.num_heads):
+            sddmm_time, att = FS_SDDMM.forward_gen_fp16_gnn(   
+                                Q_h[:,i,:].size(1),                                      
+                                inputInfo.row_pointers, 
+                                inputInfo.column_index, 
+                                inputInfo.degrees, 
+                                inputInfo.t_window_rowTensor,
+                                Q_h[:,i,:],K_h[:,i,:],inputInfo.max)
+            spmm_ones_time, rows_sum = FS_SpMM.forward_fp16_gnn_ones(   
+                                        inputInfo.row_pointers, 
+                                        inputInfo.column_index, 
+                                        att, 
+                                        inputInfo.t_window_rowTensor,
+                                        inputInfo.t_atomicTensor,
+                                        inputInfo.ones, 
+                                        inputInfo.num_nodes, 
+                                        inputInfo.ones.size(1), 
+                                        inputInfo.num_nodes_ori)
+            spmm_time, h_prime = FS_SpMM.forward_fp16_gnn(   
                                     inputInfo.row_pointers, 
                                     inputInfo.column_index, 
                                     att, 
                                     inputInfo.t_window_rowTensor,
                                     inputInfo.t_atomicTensor,
-                                    inputInfo.ones, 
+                                    V_h[:,i,:], 
                                     inputInfo.num_nodes, 
-                                    inputInfo.ones.size(1), 
+                                    V_h[:,i,:].size(1), 
                                     inputInfo.num_nodes_ori)
-        spmm_time, h_prime = FS_SpMM.forward_fp16_gnn(   
-                                inputInfo.row_pointers, 
-                                inputInfo.column_index, 
-                                att, 
-                                inputInfo.t_window_rowTensor,
-                                inputInfo.t_atomicTensor,
-                                V_h, 
-                                inputInfo.num_nodes, 
-                                V_h.size(1), 
-                                inputInfo.num_nodes_ori)
-        h_prime = h_prime.div(rows_sum) 
-        return h_prime
+            out_h[:,i,:] = h_prime.div(rows_sum) 
+        end.record()
+        end.synchronize()
+        kernel_time = start.elapsed_time(end)
+        # print(f"FS time: {kernel_time} ms")
+        return out_h, kernel_time
 
 class MultiHeadAttentionLayerDfgnnHyper(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
@@ -142,8 +172,15 @@ class MultiHeadAttentionLayerDfgnnHyper(MultiHeadAttentionLayer):
         Q_h = Q_h.view(-1, self.num_heads, self.out_dim)
         K_h = K_h.view(-1, self.num_heads, self.out_dim)
         V_h = V_h.view(-1, self.num_heads, self.out_dim)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         out = GTConvFuse_inference_hyper(dfgnn_input.row_pointers, dfgnn_input.column_index, dfgnn_input.rows, dfgnn_input.val, dfgnn_input.smem_consume, Q_h, K_h, V_h)
-        return out
+        end.record()
+        end.synchronize()
+        kernel_time = start.elapsed_time(end)
+        # print(f"GTConvFuse_inference_hyper time: {kernel_time} ms")
+        return out, kernel_time
     
 class MultiHeadAttentionLayerDfgnnTiling(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
@@ -157,8 +194,15 @@ class MultiHeadAttentionLayerDfgnnTiling(MultiHeadAttentionLayer):
         Q_h = Q_h.view(-1, self.num_heads, self.out_dim)
         K_h = K_h.view(-1, self.num_heads, self.out_dim)
         V_h = V_h.view(-1, self.num_heads, self.out_dim)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         out = GTConvFuse_inference_tiling(dfgnn_input.row_pointers, dfgnn_input.column_index, dfgnn_input.val, dfgnn_input.smem_consume, Q_h, K_h, V_h)
-        return out
+        end.record()
+        end.synchronize()
+        kernel_time = start.elapsed_time(end)
+        # print(f"GTConvFuse_inference_tiling time: {kernel_time} ms")
+        return out, kernel_time
 
 class MultiHeadAttentionLayerDense(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
@@ -185,7 +229,14 @@ class MultiHeadAttentionLayerDense(MultiHeadAttentionLayer):
         g.ndata['Q_h'] = Q_h.view(-1, self.num_heads, self.out_dim)
         g.ndata['K_h'] = K_h.view(-1, self.num_heads, self.out_dim)
         g.ndata['V_h'] = V_h.view(-1, self.num_heads, self.out_dim)
-        return self.propagate_attention(g)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        out = self.propagate_attention(g)
+        end.record()
+        end.synchronize()
+        kernel_time = start.elapsed_time(end)
+        return out, kernel_time
     
 class GraphTransformerLayer(nn.Module):
     """
@@ -239,7 +290,7 @@ class GraphTransformerLayer(nn.Module):
         h_in1 = h # for first residual connection
         
         # multi-head attention out
-        attn_out = self.attention(input, h)
+        attn_out, kernel_time = self.attention(input, h)
         h = attn_out.view(-1, self.out_channels)
         
         h = F.dropout(h, self.dropout, training=self.training)
@@ -272,7 +323,7 @@ class GraphTransformerLayer(nn.Module):
         if self.batch_norm:
             h = self.batch_norm2(h)       
 
-        return h
+        return h, kernel_time
         
     def __repr__(self):
         return '{}(in_channels={}, out_channels={}, heads={}, residual={})'.format(self.__class__.__name__,
