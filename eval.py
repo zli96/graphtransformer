@@ -1,5 +1,5 @@
 import torch
-from dgl.data import CLUSTERDataset, RedditDataset, PubmedGraphDataset, CiteseerGraphDataset, CoraGraphDataset, YelpDataset
+from dgl.data import CLUSTERDataset, RedditDataset, PubmedGraphDataset, CiteseerGraphDataset, CoraGraphDataset, YelpDataset, FlickrDataset, AMDDataset, QuestionsDataset
 from nets.SBMs_node_classification.graph_transformer_net import GraphTransformerNet
 import numpy as np
 import pandas as pd
@@ -18,6 +18,7 @@ def time_model(net_params, test_graph, device):
   for i, layer in enumerate(layers):
     net_params['MLA_type'] = layer
     for j, hidden_dim in enumerate(hidden_dims):
+      try:
         net_params['hidden_dim'] = hidden_dim
         net_params['out_dim'] = hidden_dim
         model = GraphTransformerNet(net_params)
@@ -34,6 +35,10 @@ def time_model(net_params, test_graph, device):
             time_kernel_list.append(kernel_time)
         model_times_total[i, j] = sum(time_total_list)/len(time_total_list)
         model_times_kernel[i, j] = sum(time_kernel_list)/len(time_kernel_list)
+      except Exception as e:
+        print(f"Error in layer {layer}, hidden_dim {hidden_dim}: {e}")
+        model_times_total[i, j] = 0
+        model_times_kernel[i, j] = 0
   return model_times_total, model_times_kernel
 
 def test_accuracy(net_params, test_graph, device):
@@ -44,35 +49,62 @@ def test_accuracy(net_params, test_graph, device):
   pred, _ = model.check_accuracy(test_graph)
   return pred
 
-def data_router(dataset_name):
+def data_router(dataset_name, device):
     
     print(f"===========loading dataset: {dataset_name}===========")
     if dataset_name == 'cluster':
         dataset = CLUSTERDataset(mode='test', raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[0]
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
     elif dataset_name == 'reddit':
         dataset = RedditDataset(raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[1]
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
     elif dataset_name == 'pubmed':
         dataset = PubmedGraphDataset(raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[1]
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
     elif dataset_name == 'citeseer':
         dataset = CiteseerGraphDataset(raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[1]
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
     elif dataset_name == 'cora':
         dataset = CoraGraphDataset(raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[1]
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
     elif dataset_name == 'yelp':
         dataset = YelpDataset(raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[1]
-    elif dataset_name == 'ogbn-products':
-        dataset = load_ogb_dataset(dataset_name)
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
+    elif dataset_name == 'flickr':
+        dataset = FlickrDataset(raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[1]
-    return dataset, in_dim
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
+    elif dataset_name == 'AMD':
+        dataset = AMDDataset(raw_dir=raw_dir)
+        in_dim = dataset[0].ndata['feat'].shape[1]
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
+    elif dataset_name == 'QuestionsDataset':
+        dataset = QuestionsDataset(raw_dir=raw_dir)
+        in_dim = dataset[0].ndata['feat'].shape[1]
+        test_graph = dataset[0].to(device)
+        n_classes = dataset.num_classes
+    elif dataset_name == 'ogbn-products':
+        test_graph, n_classes = load_ogb_dataset(dataset_name)
+        in_dim = test_graph.ndata['feat'].shape[1]
+        test_graph = test_graph.to(device)
+    return test_graph, in_dim, n_classes
 
 def convert_pyg_to_dgl(pyg_graph):
     import dgl
-    
     x = pyg_graph.x
     edge_index = pyg_graph.edge_index
     g = dgl.graph((edge_index[0], edge_index[1]))
@@ -80,17 +112,11 @@ def convert_pyg_to_dgl(pyg_graph):
     return g
 
 def load_ogb_dataset(dataset_name):
-    """
-    Load an OGB dataset and convert to DGL format.
-    """
-    print(f"===========loading OGB dataset: {dataset_name}===========")
     from ogb.nodeproppred import PygNodePropPredDataset
-    
-    # Load PyG dataset
     dataset = PygNodePropPredDataset(name=dataset_name, root=raw_dir)
     pyg_graph = dataset[0]
     dgl_graph = convert_pyg_to_dgl(pyg_graph)
-    return dgl_graph
+    return dgl_graph, dataset.num_classes
 
 def main():
     # Set device
@@ -111,16 +137,16 @@ def main():
         'device': device
     }
 
-    for dataset_name in ['ogbn-products']:
-    # for dataset_name in ['cluster', 'reddit', 'pubmed', 'citeseer', 'cora', 'yelp']:
-      dataset, in_dim = data_router(dataset_name)
+    # for dataset_name in ['flickr']:
+    for dataset_name in ['cluster', 'reddit', 'pubmed', 'citeseer', 'cora', 'yelp', 'AMD', 'flickr', 'QuestionsDataset', 'ogbn-products']:
+      test_graph, in_dim, n_classes = data_router(dataset_name, device)
       net_params['in_dim'] = in_dim
-      net_params['n_classes'] = dataset.num_classes
-      # Get a single test graph
-      test_graph = dataset[0].to(device)  # Get first graph    
+      net_params['n_classes'] = n_classes
+      # Get a single test grap
     
       print("test_graph.n_nodes: ", test_graph.num_nodes())
       print("test_graph.n_edges: ", test_graph.num_edges())
+      print("n_classes: ", n_classes)
       times_total, times_kernel = time_model(net_params, test_graph, device)
       df = pd.DataFrame(times_kernel, index=layers, columns=hidden_dims)
       df.index.name = 'layer'
