@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import dgl
 import dgl.function as fn
 import numpy as np
-from TCFMM import f3s_1tb1rw_scheduled_permuteV_scaleQK, f3s_1tb1rw_scheduled_permuteV
+from F3S import f3s_1tb1rw_scheduled_permuteV_scaleQK, f3s_1tb1rw_scheduled_permuteV
 from DFGNN.operators.fused_gtconv import GTConvFuse_inference_tiling, GTConvFuse_inference_hyper
 import FS_SDDMM
 import FS_SpMM

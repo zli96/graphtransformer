@@ -8,7 +8,7 @@ from layers.graph_transformer_layer import GraphTransformerLayer
     
 """
 from layers.mlp_readout_layer import MLPReadout
-from TCFMM import preprocess_gpu
+from F3S import preprocess_gpu
 
 class f3sInput:
     def __init__(self, RowWindowOffset, sortedRowWindows,\
