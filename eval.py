@@ -1,11 +1,11 @@
 import torch
-from dgl.data import CLUSTERDataset, RedditDataset, PubmedGraphDataset, CiteseerGraphDataset, CoraGraphDataset, YelpDataset, FlickrDataset, AMDDataset, QuestionsDataset
+from dgl.data import CLUSTERDataset, RedditDataset, PubmedGraphDataset, CiteseerGraphDataset, CoraGraphDataset, YelpDataset, FlickrDataset, QuestionsDataset
 from nets.SBMs_node_classification.graph_transformer_net import GraphTransformerNet
 import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix
 
-layers = ['f3s', 'dfgnn_tiling', 'flashSparse']
+layers = ['dgl','f3s', 'dfgnn_tiling', 'flashSparse']
 # layers = ['dgl', 'f3s', 'dfgnn_tiling', 'dfgnn_hyper', 'flashSparse']
 hidden_dims = [64, 128, 256]
 raw_dir = '/share/crsp/lab/amowli/share/Fused3S/dataLoader'
@@ -39,6 +39,7 @@ def time_model(net_params, test_graph, device):
         print(f"Error in layer {layer}, hidden_dim {hidden_dim}: {e}")
         model_times_total[i, j] = 0
         model_times_kernel[i, j] = 0
+      torch.cuda.empty_cache()
   return model_times_total, model_times_kernel
 
 def test_accuracy(net_params, test_graph, device):
@@ -87,20 +88,30 @@ def data_router(dataset_name, device):
         in_dim = dataset[0].ndata['feat'].shape[1]
         test_graph = dataset[0].to(device)
         n_classes = dataset.num_classes
-    elif dataset_name == 'AMD':
-        dataset = AMDDataset(raw_dir=raw_dir)
-        in_dim = dataset[0].ndata['feat'].shape[1]
-        test_graph = dataset[0].to(device)
-        n_classes = dataset.num_classes
-    elif dataset_name == 'QuestionsDataset':
+    elif dataset_name == 'Questions':
         dataset = QuestionsDataset(raw_dir=raw_dir)
         in_dim = dataset[0].ndata['feat'].shape[1]
         test_graph = dataset[0].to(device)
         n_classes = dataset.num_classes
     elif dataset_name == 'ogbn-products':
-        test_graph, n_classes = load_ogb_dataset(dataset_name)
+        test_graph, n_classes = load_pyg_dataset(dataset_name)
         in_dim = test_graph.ndata['feat'].shape[1]
         test_graph = test_graph.to(device)
+    elif dataset_name == 'ogbn-arxiv':
+        test_graph, n_classes = load_pyg_dataset(dataset_name)
+        in_dim = test_graph.ndata['feat'].shape[1]
+        test_graph = test_graph.to(device)
+    elif dataset_name == 'Ell':
+        test_graph, n_classes = load_pyg_dataset(dataset_name)
+        in_dim = test_graph.ndata['feat'].shape[1]
+        test_graph = test_graph.to(device)
+    elif dataset_name == 'github':
+        test_graph, n_classes = load_pyg_dataset(dataset_name)
+        in_dim = test_graph.ndata['feat'].shape[1]
+        test_graph = test_graph.to(device)
+    elif dataset_name == 'igb_small':
+        test_graph, n_classes = load_igb_dataset('small', device)
+        in_dim = test_graph.ndata['feat'].shape[1]
     return test_graph, in_dim, n_classes
 
 def convert_pyg_to_dgl(pyg_graph):
@@ -111,25 +122,62 @@ def convert_pyg_to_dgl(pyg_graph):
     g.ndata['feat'] = x
     return g
 
-def load_ogb_dataset(dataset_name):
-    from ogb.nodeproppred import PygNodePropPredDataset
-    dataset = PygNodePropPredDataset(name=dataset_name, root=raw_dir)
-    pyg_graph = dataset[0]
-    dgl_graph = convert_pyg_to_dgl(pyg_graph)
-    return dgl_graph, dataset.num_classes
+def load_pyg_dataset(dataset_name):
+    if dataset_name == 'ogbn-products':
+        from ogb.nodeproppred import DglNodePropPredDataset
+        dataset = DglNodePropPredDataset(name=dataset_name, root=raw_dir+'/ogbn-products')
+        dgl_graph = dataset[0][0]
+        return dgl_graph, dataset.num_classes
+    elif dataset_name == 'ogbn-arxiv':
+        from ogb.nodeproppred import DglNodePropPredDataset
+        dataset = DglNodePropPredDataset(name=dataset_name, root=raw_dir+'/ogbn-arxiv')
+        dgl_graph = dataset[0][0]
+        return dgl_graph, dataset.num_classes
+    elif dataset_name == 'Ell':
+        print("loading elliptic bitcoin")
+        from torch_geometric.datasets import EllipticBitcoinDataset
+        dataset = EllipticBitcoinDataset(root=raw_dir+'/EllipticBitcoin')
+        pyg_graph = dataset[0]
+        dgl_graph = convert_pyg_to_dgl(pyg_graph)
+        return dgl_graph, dataset.num_classes
+    elif dataset_name == 'github':
+       print("loading github")
+       from torch_geometric.datasets import GitHub
+       dataset = GitHub(root=raw_dir+'/GitHub')
+       pyg_graph = dataset[0]
+       dgl_graph = convert_pyg_to_dgl(pyg_graph)
+       return dgl_graph, dataset.num_classes
+    else:
+        raise ValueError(f"Dataset {dataset_name} not supported")
+
+class igbArgs:
+    def __init__(self, size):
+        self.path = raw_dir+'/igb'
+        self.in_memory = True
+        self.num_classes = 19
+        self.in_memory = 0
+        self.synthetic = 0
+        self.dataset_size = size
+
+def load_igb_dataset(dataset_name, device):
+   from igb.dataloader import IGB260MDGLDataset
+   args = igbArgs(dataset_name)
+   dataset = IGB260MDGLDataset(args)
+   test_graph = dataset[0].to(device)
+   return test_graph, args.num_classes
 
 def main():
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     net_params = {
-        'n_heads': 8,
+        'n_heads': 1,
         'in_feat_dropout': 0.0,
         'dropout': 0.0,
         'L': 10,  # Number of layers
         'residual': True,
         'readout': 'mean',
-        'layer_norm': False,
-        'batch_norm': True,
+        'layer_norm': True,
+        'batch_norm': False,
         'self_loop': False,
         'lap_pos_enc': False,
         'wl_pos_enc': False,
@@ -137,8 +185,8 @@ def main():
         'device': device
     }
 
-    # for dataset_name in ['flickr']:
-    for dataset_name in ['cluster', 'reddit', 'pubmed', 'citeseer', 'cora', 'yelp', 'AMD', 'flickr', 'QuestionsDataset', 'ogbn-products']:
+    # for dataset_name in ['pubmed']:
+    for dataset_name in ['cluster', 'reddit', 'pubmed', 'citeseer', 'cora', 'yelp', 'flickr', 'Questions', 'ogbn-products', 'ogbn-arxiv', 'igb_small']:
       test_graph, in_dim, n_classes = data_router(dataset_name, device)
       net_params['in_dim'] = in_dim
       net_params['n_classes'] = n_classes
@@ -150,10 +198,10 @@ def main():
       times_total, times_kernel = time_model(net_params, test_graph, device)
       df = pd.DataFrame(times_kernel, index=layers, columns=hidden_dims)
       df.index.name = 'layer'
-      df.to_csv(f'gt_times_kernel_{dataset_name}.csv')
+      df.to_csv(f'gt_times_kernel_{net_params["n_heads"]}heads_{dataset_name}.csv')
       df = pd.DataFrame(times_total, index=layers, columns=hidden_dims)
       df.index.name = 'layer'
-      df.to_csv(f'gt_times_total_{dataset_name}.csv')
+      df.to_csv(f'gt_times_total_{net_params["n_heads"]}heads_{dataset_name}.csv')
 
 if __name__ == '__main__':
     main()

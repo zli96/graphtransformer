@@ -83,32 +83,29 @@ class MultiHeadAttentionLayerF3S(MultiHeadAttentionLayer):
     def forward(self, f3s_input, h):
         # Override the forward method to use F3S-specific implementation
         h = h.to(torch.float16)
-        Q_h = self.Q(h).view(-1, self.num_heads, self.out_dim)
-        K_h = self.K(h).view(-1, self.num_heads, self.out_dim)
-        V_h = self.V(h).view(-1, self.num_heads, self.out_dim)
-        h_out = torch.zeros(h.shape[0], self.num_heads, self.out_dim, dtype=torch.float32, device=h.device)
+        Q_h = self.Q(h)
+        K_h = self.K(h)
+        V_h = self.V(h)
         n_warp_per_block = 10
         # out is [time, O, S]
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for i in range(self.num_heads):
-            out = f3s_1tb1rw_scheduled_permuteV_scaleQK(
-                    f3s_input.RowWindowOffset, 
-                    f3s_input.sortedRowWindows, 
-                    f3s_input.SparseAToXindex, 
-                    f3s_input.TCblockBitMap, 
-                    f3s_input.num_nodes, 
-                    Q_h[:,i,:], K_h[:,i,:], V_h[:,i,:], 
-                    np.sqrt(self.out_dim), 
-                    n_warp_per_block)
-            h_out[:,i,:] = out[1]
+        out = f3s_1tb1rw_scheduled_permuteV_scaleQK(
+                f3s_input.RowWindowOffset, 
+                f3s_input.sortedRowWindows, 
+                f3s_input.SparseAToXindex, 
+                f3s_input.TCblockBitMap, 
+                f3s_input.num_nodes, 
+                Q_h, K_h, V_h, 
+                np.sqrt(self.out_dim), 
+                n_warp_per_block)
         end.record()
         end.synchronize()
         kernel_time = start.elapsed_time(end)
         # print(f"f3s_1tb1rw_scheduled_permuteV_scaleQK time: {out[0]} ms")
         # return out
-        return h_out, kernel_time
+        return out[1], kernel_time
 
 class MultiHeadAttentionLayerFlashSparse(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
@@ -118,47 +115,45 @@ class MultiHeadAttentionLayerFlashSparse(MultiHeadAttentionLayer):
         self.V = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
     def forward(self, inputInfo, h):
         h = h.to(torch.float16)
-        Q_h = self.Q(h).view(-1, self.num_heads, self.out_dim)
-        K_h = self.K(h).view(-1, self.num_heads, self.out_dim)
-        V_h = self.V(h).view(-1, self.num_heads, self.out_dim)
-        out_h = torch.zeros(h.shape[0], self.num_heads, self.out_dim, dtype=torch.float32, device=h.device)
+        Q_h = self.Q(h)
+        K_h = self.K(h)
+        V_h = self.V(h)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        for i in range(self.num_heads):
-            sddmm_time, att = FS_SDDMM.forward_gen_fp16_gnn(   
-                                Q_h[:,i,:].size(1),                                      
-                                inputInfo.row_pointers, 
-                                inputInfo.column_index, 
-                                inputInfo.degrees, 
-                                inputInfo.t_window_rowTensor,
-                                Q_h[:,i,:],K_h[:,i,:],inputInfo.max)
-            spmm_ones_time, rows_sum = FS_SpMM.forward_fp16_gnn_ones(   
-                                        inputInfo.row_pointers, 
-                                        inputInfo.column_index, 
-                                        att, 
-                                        inputInfo.t_window_rowTensor,
-                                        inputInfo.t_atomicTensor,
-                                        inputInfo.ones, 
-                                        inputInfo.num_nodes, 
-                                        inputInfo.ones.size(1), 
-                                        inputInfo.num_nodes_ori)
-            spmm_time, h_prime = FS_SpMM.forward_fp16_gnn(   
+        sddmm_time, att = FS_SDDMM.forward_gen_fp16_gnn(   
+                            Q_h.size(1),                                      
+                            inputInfo.row_pointers, 
+                            inputInfo.column_index, 
+                            inputInfo.degrees, 
+                            inputInfo.t_window_rowTensor,
+                            Q_h,K_h,inputInfo.max)
+        spmm_ones_time, rows_sum = FS_SpMM.forward_fp16_gnn_ones(   
                                     inputInfo.row_pointers, 
                                     inputInfo.column_index, 
                                     att, 
                                     inputInfo.t_window_rowTensor,
                                     inputInfo.t_atomicTensor,
-                                    V_h[:,i,:], 
+                                    inputInfo.ones, 
                                     inputInfo.num_nodes, 
-                                    V_h[:,i,:].size(1), 
+                                    inputInfo.ones.size(1), 
                                     inputInfo.num_nodes_ori)
-            out_h[:,i,:] = h_prime.div(rows_sum) 
+        spmm_time, h_prime = FS_SpMM.forward_fp16_gnn(   
+                                inputInfo.row_pointers, 
+                                inputInfo.column_index, 
+                                att, 
+                                inputInfo.t_window_rowTensor,
+                                inputInfo.t_atomicTensor,
+                                V_h, 
+                                inputInfo.num_nodes, 
+                                V_h.size(1), 
+                                inputInfo.num_nodes_ori)
+        h_prime = h_prime.div(rows_sum) 
         end.record()
         end.synchronize()
         kernel_time = start.elapsed_time(end)
         # print(f"FS time: {kernel_time} ms")
-        return out_h, kernel_time
+        return h_prime, kernel_time
 
 class MultiHeadAttentionLayerDfgnnHyper(MultiHeadAttentionLayer):
     def __init__(self, in_dim, out_dim, num_heads, use_bias, seed=False):
