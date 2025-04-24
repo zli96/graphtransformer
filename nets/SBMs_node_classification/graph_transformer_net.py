@@ -93,17 +93,14 @@ class GraphTransformerNet(nn.Module):
         indptr, indices, _ = g.adj_tensors('csr')
         num_nodes = indptr.shape[0] - 1
         num_edges = indices.shape[0]
-        # Set up tensors for preprocessing
         num_row_windows = (num_nodes + BLK_H - 1) // BLK_H
-        # Move tensors to GPU
         blockPartition_cuda = torch.zeros(num_row_windows, dtype=torch.int).cuda()
         edgeToColumn_cuda = torch.zeros(num_edges, dtype=torch.int).cuda()
         edgeToRow_cuda = torch.zeros(num_edges, dtype=torch.int).cuda()
-        row_pointers = indptr.to(torch.int32)
-        column_index = indices.to(torch.int32)
-        RowWindowOffset, sortedRowWindows, TCblockRowid,\
-        TCblocktileId, TCblockoffset, SparseAToXindex,\
-        TBBoundaries, TCblockBitMap, block_count =  preprocess_gpu(column_index, row_pointers, num_nodes, 
+        row_pointers = indptr.to(torch.int32).cuda()
+        column_index = indices.to(torch.int32).cuda()
+        RowWindowOffset, sortedRowWindows, _, _, _, \
+        SparseAToXindex, TCblockBitMap, _ = preprocess_gpu(column_index, row_pointers, num_nodes, 
                                 BLK_H, BLK_W, blockPartition_cuda, 
                                 edgeToColumn_cuda, edgeToRow_cuda)
         f3s_input = f3sInput(RowWindowOffset, sortedRowWindows, SparseAToXindex, TCblockBitMap, num_nodes)

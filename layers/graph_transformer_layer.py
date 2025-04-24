@@ -81,16 +81,15 @@ class MultiHeadAttentionLayerF3S(MultiHeadAttentionLayer):
         self.V = nn.Linear(in_dim, out_dim * num_heads, use_bias, dtype=torch.float16)
     
     def forward(self, f3s_input, h):
-        # Override the forward method to use F3S-specific implementation
         h = h.to(torch.float16)
         Q_h = self.Q(h)
         K_h = self.K(h)
         V_h = self.V(h)
         n_warp_per_block = 10
-        # out is [time, O, S]
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
+        # out is [time, O, S]
         out = f3s_1tb1rw_scheduled_permuteV_scaleQK(
                 f3s_input.RowWindowOffset, 
                 f3s_input.sortedRowWindows, 
@@ -103,8 +102,6 @@ class MultiHeadAttentionLayerF3S(MultiHeadAttentionLayer):
         end.record()
         end.synchronize()
         kernel_time = start.elapsed_time(end)
-        # print(f"f3s_1tb1rw_scheduled_permuteV_scaleQK time: {out[0]} ms")
-        # return out
         return out[1], kernel_time
 
 class MultiHeadAttentionLayerFlashSparse(MultiHeadAttentionLayer):

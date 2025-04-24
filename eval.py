@@ -5,41 +5,32 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix
 
-layers = ['dgl','f3s', 'dfgnn_tiling', 'flashSparse']
-# layers = ['dgl', 'f3s', 'dfgnn_tiling', 'dfgnn_hyper', 'flashSparse']
-hidden_dims = [64, 128, 256]
+
+hidden_dim = 64
+niter = 10
 raw_dir = '/share/crsp/lab/amowli/share/Fused3S/dataLoader'
 
 def time_model(net_params, test_graph, device):
-  niter = 10
-  model_times_total = np.empty((len(layers), len(hidden_dims)))
-  model_times_kernel = np.empty((len(layers), len(hidden_dims)))
-
-  for i, layer in enumerate(layers):
-    net_params['MLA_type'] = layer
-    for j, hidden_dim in enumerate(hidden_dims):
-      try:
-        net_params['hidden_dim'] = hidden_dim
-        net_params['out_dim'] = hidden_dim
-        model = GraphTransformerNet(net_params)
-        model = model.to(device)
-        model.eval()
-        time_total_list = []
-        time_kernel_list = []
-        with torch.no_grad():
-          for k in range(10): 
-            model(test_graph)
-          for k in range(niter):
-            pred, total_time, kernel_time = model(test_graph)
-            time_total_list.append(total_time)
-            time_kernel_list.append(kernel_time)
-        model_times_total[i, j] = sum(time_total_list)/len(time_total_list)
-        model_times_kernel[i, j] = sum(time_kernel_list)/len(time_kernel_list)
-      except Exception as e:
-        print(f"Error in layer {layer}, hidden_dim {hidden_dim}: {e}")
-        model_times_total[i, j] = 0
-        model_times_kernel[i, j] = 0
-      torch.cuda.empty_cache()
+  model_times_total = np.empty((1, niter))
+  model_times_kernel = np.empty((1, niter))
+  try:
+    net_params['hidden_dim'] = hidden_dim
+    net_params['out_dim'] = hidden_dim
+    model = GraphTransformerNet(net_params)
+    model = model.to(device)
+    model.eval()
+    with torch.no_grad():
+      for k in range(niter): 
+          model(test_graph)
+      for k in range(niter):
+          pred, total_time, kernel_time = model(test_graph)
+          model_times_total[0, k] = total_time
+          model_times_kernel[0, k] = kernel_time
+  except Exception as e:
+    print(f"Error in layer {net_params['MLA_type']}, hidden_dim {hidden_dim}: {e}")
+    for k in range(niter):
+      model_times_total[0, k] = np.nan
+      model_times_kernel[0, k] = np.nan
   return model_times_total, model_times_kernel
 
 def test_accuracy(net_params, test_graph, device):
@@ -51,7 +42,6 @@ def test_accuracy(net_params, test_graph, device):
   return pred
 
 def data_router(dataset_name, device):
-    
     print(f"===========loading dataset: {dataset_name}===========")
     if dataset_name == 'cluster':
         dataset = CLUSTERDataset(mode='test', raw_dir=raw_dir)
@@ -93,25 +83,29 @@ def data_router(dataset_name, device):
         in_dim = dataset[0].ndata['feat'].shape[1]
         test_graph = dataset[0].to(device)
         n_classes = dataset.num_classes
-    elif dataset_name == 'ogbn-products':
-        test_graph, n_classes = load_pyg_dataset(dataset_name)
-        in_dim = test_graph.ndata['feat'].shape[1]
-        test_graph = test_graph.to(device)
-    elif dataset_name == 'ogbn-arxiv':
-        test_graph, n_classes = load_pyg_dataset(dataset_name)
-        in_dim = test_graph.ndata['feat'].shape[1]
-        test_graph = test_graph.to(device)
-    elif dataset_name == 'Ell':
-        test_graph, n_classes = load_pyg_dataset(dataset_name)
-        in_dim = test_graph.ndata['feat'].shape[1]
-        test_graph = test_graph.to(device)
-    elif dataset_name == 'github':
-        test_graph, n_classes = load_pyg_dataset(dataset_name)
+    elif dataset_name in ['ogbn-products', 'ogbn-arxiv', 'Ell', 'github', 'AmazonProducts']:
+        test_graph, n_classes = load_dataset(dataset_name)
         in_dim = test_graph.ndata['feat'].shape[1]
         test_graph = test_graph.to(device)
     elif dataset_name == 'igb_small':
         test_graph, n_classes = load_igb_dataset('small', device)
         in_dim = test_graph.ndata['feat'].shape[1]
+    elif dataset_name == 'igb_medium':
+        test_graph, n_classes = load_igb_dataset('medium', device)
+        in_dim = test_graph.ndata['feat'].shape[1]
+    elif dataset_name == 'igb_large':
+        test_graph, n_classes = load_igb_dataset('large', device)
+        in_dim = test_graph.ndata['feat'].shape[1]
+    elif dataset_name == 'ZINC':
+        test_graph, n_classes = load_dataset(dataset_name)
+        in_dim = torch.max(test_graph.ndata['feat']).item() + 1
+        test_graph = test_graph.to(device)
+    elif dataset_name in ['Peptides-struct', 'Peptides-func', 'PascalVOC-SP', 'COCO-SP']:
+        test_graph, n_classes = load_dataset(dataset_name)
+        print(test_graph)
+        test_graph.ndata['feat'] = test_graph.ndata['feat'].to(torch.float32)
+        in_dim = test_graph.ndata['feat'].shape[1]
+        test_graph = test_graph.to(device)
     return test_graph, in_dim, n_classes
 
 def convert_pyg_to_dgl(pyg_graph):
@@ -122,7 +116,7 @@ def convert_pyg_to_dgl(pyg_graph):
     g.ndata['feat'] = x
     return g
 
-def load_pyg_dataset(dataset_name):
+def load_dataset(dataset_name, batch_size=1024):
     if dataset_name == 'ogbn-products':
         from ogb.nodeproppred import DglNodePropPredDataset
         dataset = DglNodePropPredDataset(name=dataset_name, root=raw_dir+'/ogbn-products')
@@ -133,6 +127,21 @@ def load_pyg_dataset(dataset_name):
         dataset = DglNodePropPredDataset(name=dataset_name, root=raw_dir+'/ogbn-arxiv')
         dgl_graph = dataset[0][0]
         return dgl_graph, dataset.num_classes
+    elif dataset_name == 'ZINC':
+        print("loading ZINC")
+        from dgl.data import ZINCDataset
+        import dgl
+        dataset = ZINCDataset(mode='train', raw_dir=raw_dir+'/ZINC')
+        batched_g = dgl.batch([dataset[i][0] for i in range(batch_size)])
+        return batched_g, 2
+    elif dataset_name in ['Peptides-struct', 'Peptides-func', 'PascalVOC-SP', 'COCO-SP']:
+        print("loading Peptides-struct")
+        from torch_geometric.datasets import LRGBDataset
+        from torch_geometric.data import Batch
+        dataset = LRGBDataset(root=raw_dir+'/PeptidesStruct', name=dataset_name)
+        batched_g = Batch.from_data_list([dataset[i] for i in range(batch_size)])
+        batched_g = convert_pyg_to_dgl(batched_g)
+        return batched_g, 2
     elif dataset_name == 'Ell':
         print("loading elliptic bitcoin")
         from torch_geometric.datasets import EllipticBitcoinDataset
@@ -147,6 +156,13 @@ def load_pyg_dataset(dataset_name):
        pyg_graph = dataset[0]
        dgl_graph = convert_pyg_to_dgl(pyg_graph)
        return dgl_graph, dataset.num_classes
+    elif dataset_name == 'AmazonProducts':
+        print("loading AmazonProducts")
+        from torch_geometric.datasets import AmazonProducts
+        dataset = AmazonProducts(root=raw_dir+'/AmazonProducts')
+        pyg_graph = dataset[0]
+        dgl_graph = convert_pyg_to_dgl(pyg_graph)
+        return dgl_graph, dataset.num_classes
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 
@@ -166,7 +182,7 @@ def load_igb_dataset(dataset_name, device):
    test_graph = dataset[0].to(device)
    return test_graph, args.num_classes
 
-def main():
+def main(args):
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     net_params = {
@@ -185,23 +201,37 @@ def main():
         'device': device
     }
 
-    # for dataset_name in ['pubmed']:
-    for dataset_name in ['cluster', 'reddit', 'pubmed', 'citeseer', 'cora', 'yelp', 'flickr', 'Questions', 'ogbn-products', 'ogbn-arxiv', 'igb_small']:
-      test_graph, in_dim, n_classes = data_router(dataset_name, device)
-      net_params['in_dim'] = in_dim
-      net_params['n_classes'] = n_classes
-      # Get a single test grap
-    
-      print("test_graph.n_nodes: ", test_graph.num_nodes())
-      print("test_graph.n_edges: ", test_graph.num_edges())
-      print("n_classes: ", n_classes)
-      times_total, times_kernel = time_model(net_params, test_graph, device)
-      df = pd.DataFrame(times_kernel, index=layers, columns=hidden_dims)
-      df.index.name = 'layer'
-      df.to_csv(f'gt_times_kernel_{net_params["n_heads"]}heads_{dataset_name}.csv')
-      df = pd.DataFrame(times_total, index=layers, columns=hidden_dims)
-      df.index.name = 'layer'
-      df.to_csv(f'gt_times_total_{net_params["n_heads"]}heads_{dataset_name}.csv')
+    test_graph, in_dim, n_classes = data_router(args.dataset, device)
+    net_params['in_dim'] = in_dim
+    net_params['n_classes'] = n_classes
+    net_params['MLA_type'] = args.alg
+    # Get a single test grap
+
+    print("test_graph.n_nodes: ", test_graph.num_nodes())
+    print("test_graph.n_edges: ", test_graph.num_edges())
+    print("in_dim: ", in_dim)
+    print("n_classes: ", n_classes)
+    times_total, times_kernel = time_model(net_params, test_graph, device)
+    df = pd.DataFrame(times_kernel, index=[args.alg], columns=range(niter))
+    df.index.name = 'layer'
+    df.to_csv(f'gt_times_kernel_{net_params["n_heads"]}heads_{args.alg}_{args.dataset}.csv')
+    df = pd.DataFrame(times_total, index=[args.alg], columns=range(niter))
+    df.index.name = 'layer'
+    df.to_csv(f'gt_times_total_{net_params["n_heads"]}heads_{args.alg}_{args.dataset}.csv')
 
 if __name__ == '__main__':
-    main()
+    import os
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--alg', type=str, default='f3s', 
+                        choices=['dgl', 'f3s', 'dfgnn_hyper', 
+                                 'dfgnn_tiling', 'flashSparse'])
+    parser.add_argument('--dataset', type=str, default='Ell',
+                        choices=['Ell', 'github', 'igb_small', 
+                                 'reddit', 'ogbn-products', 
+                                 'AmazonProducts', 'ZINC', 
+                                 'Peptides-struct', 'Peptides-func',
+                                 'PascalVOC-SP', 'COCO-SP'])
+    args = parser.parse_args()
+    main(args)
